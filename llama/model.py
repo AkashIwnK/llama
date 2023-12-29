@@ -15,6 +15,8 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
 
 @dataclass
 class ModelArgs:
@@ -73,7 +75,8 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
-        output = self._norm(x.float()).type_as(x)
+        with record_function("FORWARD RMSNorm"):
+          output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
 
@@ -270,37 +273,38 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-        bsz, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        with record_function("FORWARD ATTENTION"):
+          bsz, seqlen, _ = x.shape
+          xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+          xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+          xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+          xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+          xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
+          self.cache_k = self.cache_k.to(xq)
+          self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+          self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+          self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+          keys = self.cache_k[:bsz, : start_pos + seqlen]
+          values = self.cache_v[:bsz, : start_pos + seqlen]
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+          # repeat k/v heads if n_kv_heads < n_heads
+          keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+          values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+          xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+          keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+          values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+          scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+          if mask is not None:
+              scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+          scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+          output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+          output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
 
@@ -403,10 +407,11 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention.forward(
-            self.attention_norm(x), start_pos, freqs_cis, mask
-        )
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        with record_function("FORWARD TRANSFORMER BLOCK"):
+          h = x + self.attention.forward(
+              self.attention_norm(x), start_pos, freqs_cis, mask
+          )
+          out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
 
@@ -466,30 +471,31 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        with record_function("FORWARD TRANSFORMER"):
+          _bsz, seqlen = tokens.shape
+          h = self.tok_embeddings(tokens)
+          self.freqs_cis = self.freqs_cis.to(h.device)
+          freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
-        mask = None
-        if seqlen > 1:
-            mask = torch.full(
-                (seqlen, seqlen), float("-inf"), device=tokens.device
-            )
+          mask = None
+          if seqlen > 1:
+              mask = torch.full(
+                  (seqlen, seqlen), float("-inf"), device=tokens.device
+              )
 
-            mask = torch.triu(mask, diagonal=1)
+              mask = torch.triu(mask, diagonal=1)
 
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack([
-                torch.zeros((seqlen, start_pos), device=tokens.device),
-                mask
-            ]).type_as(h)
+              # When performing key-value caching, we compute the attention scores
+              # only for the new sequence. Thus, the matrix of scores is of size
+              # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+              # j > cache_len + i, since row i corresponds to token cache_len + i.
+              mask = torch.hstack([
+                  torch.zeros((seqlen, start_pos), device=tokens.device),
+                  mask
+              ]).type_as(h)
 
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)
-        output = self.output(h).float()
+          for layer in self.layers:
+              h = layer(h, start_pos, freqs_cis, mask)
+          h = self.norm(h)
+          output = self.output(h).float()
         return output
